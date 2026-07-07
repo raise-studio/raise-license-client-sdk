@@ -2,7 +2,7 @@
     "name": "raise-studio/license-client",
     "description": "Standardized PHP SDK for Raise Studio product license gating",
     "type": "library",
-    "license": "MIT",
+    "license": "proprietary",
     "autoload": {
         "psr-4": {
             "RaiseStudio\\License\\": "src/License/",

@@ -203,4 +203,4 @@ JWT 有效 (6h)?          → JWT payload.features[]
 
 ## License
 
-MIT
+Proprietary — Raise Studio. All rights reserved. 仅供 Raise Studio 授权产品使用，禁止再分发。
