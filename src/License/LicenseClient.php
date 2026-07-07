@@ -2,8 +2,8 @@
 
 namespace RaiseStudio\License;
 
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Http;
+use RaiseStudio\License\Contracts\CacheInterface;
+use RaiseStudio\License\Contracts\HttpClientInterface;
 use RaiseStudio\License\Exceptions\LicenseRevokedException;
 
 class LicenseClient
@@ -21,6 +21,11 @@ class LicenseClient
     private string $configKey;
 
     private JwtVerifier $verifier;
+    private CacheInterface $cache;
+    private HttpClientInterface $http;
+
+    /** 当前站点 URL（由调用方传入，解耦框架） */
+    private string $siteUrl;
 
     /** 单次请求内的内存缓存 */
     private ?object $cachedPayload = null;
@@ -34,17 +39,26 @@ class LicenseClient
     /**
      * 构造函数
      *
-     * @param string $productCode   产品代码（对应 Server product slug）
-     * @param string $publicKeyBase64 RSA 公钥 Base64
-     * @param string|null $apiBaseUrl   License Server API 地址
-     * @param string|null $keyPrefix    License Key 前缀（null 时从 KEY_PREFIX_MAP 自动推导）
+     * @param string              $productCode    产品代码（对应 Server product slug）
+     * @param string              $publicKeyBase64 RSA 公钥 Base64
+     * @param CacheInterface      $cache           缓存实现（Laravel / WordPress / Native）
+     * @param HttpClientInterface $http            HTTP 客户端实现
+     * @param string|null         $apiBaseUrl      License Server API 地址
+     * @param string|null         $siteUrl          当前站点 URL
+     * @param string|null         $keyPrefix       License Key 前缀（null 时从 KEY_PREFIX_MAP 自动推导）
      */
     public function __construct(
         private readonly string $productCode,
         private readonly string $publicKeyBase64,
+        CacheInterface $cache,
+        HttpClientInterface $http,
         ?string $apiBaseUrl = null,
+        ?string $siteUrl = null,
         ?string $keyPrefix = null,
     ) {
+        $this->cache = $cache;
+        $this->http = $http;
+
         $this->keyPrefix = $keyPrefix
             ?? self::KEY_PREFIX_MAP[$productCode]
             ?? strtoupper(substr($productCode, 0, 2));
@@ -53,6 +67,9 @@ class LicenseClient
         $this->configKey = "raise_license:{$productCode}:config";
         $this->apiBaseUrl = $apiBaseUrl
             ?? 'https://license.raise-studio.com/api/v1';
+
+        // 站点 URL 由调用方显式传入，不依赖框架 helper
+        $this->siteUrl = $siteUrl ?? $this->detectSiteUrl();
 
         $this->verifier = new JwtVerifier(
             $this->productCode,
@@ -101,11 +118,11 @@ class LicenseClient
     }
 
     /**
-     * 获取当前站点 URL（供调用方使用）
+     * 获取当前站点 URL
      */
     public function getSiteUrl(): string
     {
-        return config('app.url');
+        return $this->siteUrl;
     }
 
     /**
@@ -268,8 +285,8 @@ class LicenseClient
             return $this->cachedPayload;
         }
 
-        // ② 从 Laravel cache 读 JWT
-        $token = Cache::get($this->cacheKey);
+        // ② 从缓存读 JWT
+        $token = $this->cache->get($this->cacheKey);
 
         if ($token) {
             try {
@@ -336,7 +353,7 @@ class LicenseClient
     }
 
     // ══════════════════════════════════════════════════
-    //  API 通信
+    //  API 通信（通过 HTTP 接口适配）
     // ══════════════════════════════════════════════════
 
     /**
@@ -348,16 +365,24 @@ class LicenseClient
     private function requestToken(string $licenseKey): ?array
     {
         try {
-            $response = Http::timeout(15)
-                ->post(rtrim($this->apiBaseUrl, '/') . '/token', [
+            $response = $this->http->post(
+                rtrim($this->apiBaseUrl, '/') . '/token',
+                [
                     'license_key' => $licenseKey,
                     'site_url'    => $this->getSiteUrl(),
                     'product'     => $this->productCode,
-                ]);
+                ],
+                15
+            );
+
+            // 网络不可达（适配器返回 statusCode=0）
+            if ($response->statusCode === 0) {
+                return null;
+            }
 
             // 速率限制
-            if ($response->status() === 429) {
-                $retryAfter = (int) ($response->header('Retry-After') ?? 60);
+            if ($response->statusCode === 429) {
+                $retryAfter = (int) ($response->header('Retry-After') ?: 60);
 
                 return [
                     'token'  => null,
@@ -400,7 +425,7 @@ class LicenseClient
                 return [
                     'token'  => null,
                     'error'  => 'http_error',
-                    'message' => "服务器返回错误 (HTTP {$response->status()})",
+                    'message' => "服务器返回错误 (HTTP {$response->statusCode})",
                 ];
             }
 
@@ -433,16 +458,15 @@ class LicenseClient
     private function callDeactivate(string $key): void
     {
         try {
-            $response = Http::timeout(10)
-                ->post(rtrim($this->apiBaseUrl, '/') . '/deactivate', [
+            $response = $this->http->post(
+                rtrim($this->apiBaseUrl, '/') . '/deactivate',
+                [
                     'license_key' => $key,
                     'site_url'    => $this->getSiteUrl(),
                     'product'     => $this->productCode,
-                ]);
-
-            if ($response->status() === 429) {
-                // 速率限制 — 解绑通常不紧急，静默忽略
-            }
+                ],
+                10
+            );
         } catch (\Exception $e) {
             // 解绑失败不阻塞本地清除
         }
@@ -461,14 +485,21 @@ class LicenseClient
         }
 
         try {
-            $response = Http::timeout(10)
-                ->post(rtrim($this->apiBaseUrl, '/') . '/heartbeat', [
+            $response = $this->http->post(
+                rtrim($this->apiBaseUrl, '/') . '/heartbeat',
+                [
                     'license_key' => $stored['key'],
                     'site_url'    => $this->getSiteUrl(),
                     'product'     => $this->productCode,
-                ]);
+                ],
+                10
+            );
 
-            if ($response->status() === 429) {
+            if ($response->statusCode === 0) {
+                return null; // 网络不可达
+            }
+
+            if ($response->statusCode === 429) {
                 return ['valid' => true, '_rate_limited' => true, 'token_version' => $stored['token_version'] ?? 0];
             }
 
@@ -484,7 +515,7 @@ class LicenseClient
      * 调用 Server /heartbeat 端点，比较 token_version，
      * 如发现版本号增大则清除本地状态并抛出 LicenseRevokedException。
      *
-     * 建议由宿主应用通过定时任务（如 Laravel Scheduler）每 5-30 分钟调用一次。
+     * 建议由宿主应用通过定时任务（如 Laravel Scheduler / WordPress Cron）每 5-30 分钟调用一次。
      *
      * @return array{valid: bool, features: array, plan: string, ...}|null
      *
@@ -539,18 +570,18 @@ class LicenseClient
     }
 
     // ══════════════════════════════════════════════════
-    //  缓存与存储
+    //  缓存与存储（通过 Cache 接口适配）
     // ══════════════════════════════════════════════════
 
     private function cacheToken(string $token): void
     {
-        Cache::put($this->cacheKey, $token, $this->tokenTtl);
+        $this->cache->put($this->cacheKey, $token, $this->tokenTtl);
         $this->cachedPayload = null; // 清除内存缓存，下次重新验证
     }
 
     private function storeConfig(string $key, string $email, string $expiresAt, int $tokenVersion = 0): void
     {
-        Cache::forever($this->configKey, [
+        $this->cache->forever($this->configKey, [
             'key'              => $key,
             'email'            => $email,
             'activated'        => true,
@@ -562,7 +593,7 @@ class LicenseClient
 
     private function getStoredConfig(): array
     {
-        return Cache::get($this->configKey, [
+        return $this->cache->get($this->configKey, [
             'key'              => '',
             'email'            => '',
             'activated'        => false,
@@ -586,7 +617,7 @@ class LicenseClient
     {
         $config = $this->getStoredConfig();
         $config['last_verified_at'] = time();
-        Cache::forever($this->configKey, $config);
+        $this->cache->forever($this->configKey, $config);
     }
 
     /**
@@ -597,14 +628,14 @@ class LicenseClient
         $config = $this->getStoredConfig();
         if (! empty($config['key'])) {
             $config['token_version'] = $version;
-            Cache::forever($this->configKey, $config);
+            $this->cache->forever($this->configKey, $config);
         }
     }
 
     private function clearLocalState(): void
     {
-        Cache::forget($this->cacheKey);
-        Cache::forget($this->configKey);
+        $this->cache->forget($this->cacheKey);
+        $this->cache->forget($this->configKey);
         $this->cachedPayload = null;
     }
 
@@ -649,5 +680,38 @@ class LicenseClient
         $config = $this->getStoredConfig();
 
         return $config['activated'] ? ($config['key'] ?? null) : null;
+    }
+
+    /**
+     * 自动检测站点 URL
+     *
+     * 作为 $siteUrl 未显式传入时的 fallback。
+     * 按顺序检测：WordPress → Laravel → 通用 PHP。
+     */
+    private function detectSiteUrl(): string
+    {
+        // WordPress
+        if (function_exists('get_site_url')) {
+            return get_site_url();
+        }
+
+        // Laravel（仅当 illuminate/support 已安装时才可用）
+        if (function_exists('config')) {
+            return config('app.url');
+        }
+
+        // 通用 PHP fallback — 从 $_SERVER 自动构建
+        return $this->buildSiteUrlFromServer();
+    }
+
+    /**
+     * 从 $_SERVER 自动构建站点 URL
+     */
+    private function buildSiteUrlFromServer(): string
+    {
+        $scheme = (! empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
+
+        return rtrim("{$scheme}://{$host}", '/');
     }
 }
