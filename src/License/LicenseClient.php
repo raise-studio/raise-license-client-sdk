@@ -1,0 +1,653 @@
+<?php
+
+namespace RaiseStudio\License;
+
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
+use RaiseStudio\License\Exceptions\LicenseRevokedException;
+
+class LicenseClient
+{
+    /** 本地缓存 key */
+    private string $cacheKey;
+
+    /** JWT Token 缓存 TTL（秒，与 License Server 一致） */
+    private int $tokenTtl = 21600; // 6 小时
+
+    /** License Server API 基础地址 */
+    private string $apiBaseUrl;
+
+    /** License Key 存储 key */
+    private string $configKey;
+
+    private JwtVerifier $verifier;
+
+    /** 单次请求内的内存缓存 */
+    private ?object $cachedPayload = null;
+
+    /** License Key 前缀映射（productCode → 前缀） */
+    private const KEY_PREFIX_MAP = [
+        'raise-import' => 'RI',
+        'raise-media'  => 'RM',
+    ];
+
+    /**
+     * 构造函数
+     *
+     * @param string $productCode   产品代码（对应 Server product slug）
+     * @param string $publicKeyBase64 RSA 公钥 Base64
+     * @param string|null $apiBaseUrl   License Server API 地址
+     * @param string|null $keyPrefix    License Key 前缀（null 时从 KEY_PREFIX_MAP 自动推导）
+     */
+    public function __construct(
+        private readonly string $productCode,
+        private readonly string $publicKeyBase64,
+        ?string $apiBaseUrl = null,
+        ?string $keyPrefix = null,
+    ) {
+        $this->keyPrefix = $keyPrefix
+            ?? self::KEY_PREFIX_MAP[$productCode]
+            ?? strtoupper(substr($productCode, 0, 2));
+
+        $this->cacheKey = "raise_license:{$productCode}:jwt";
+        $this->configKey = "raise_license:{$productCode}:config";
+        $this->apiBaseUrl = $apiBaseUrl
+            ?? 'https://license.raise-studio.com/api/v1';
+
+        $this->verifier = new JwtVerifier(
+            $this->productCode,
+            $this->publicKeyBase64
+        );
+    }
+
+    // ══════════════════════════════════════════════════
+    //  公开接口（所有调用方不改）
+    // ══════════════════════════════════════════════════
+
+    /**
+     * 是否为 Pro 版本
+     *
+     * 保持此方法名为 isPro() 以兼容现有代码。
+     */
+    public function isPro(): bool
+    {
+        return $this->hasFeature('*');
+    }
+
+    /**
+     * 获取当前可用的 Pro 功能列表
+     *
+     * @return string[]
+     */
+    public function getFeatures(): array
+    {
+        $payload = $this->getVerifiedPayload();
+
+        return $payload ? ($payload->features ?? []) : [];
+    }
+
+    /**
+     * 检查是否拥有指定功能
+     *
+     * @param string $feature 功能标识，'*' 表示任意功能
+     */
+    public function hasFeature(string $feature): bool
+    {
+        if ($feature === '*') {
+            return ! empty($this->getFeatures());
+        }
+
+        return in_array($feature, $this->getFeatures(), true);
+    }
+
+    /**
+     * 获取当前站点 URL（供调用方使用）
+     */
+    public function getSiteUrl(): string
+    {
+        return config('app.url');
+    }
+
+    /**
+     * 获取已验证的 JWT payload（供 FeatureGate 使用）
+     */
+    public function getPayload(): ?object
+    {
+        return $this->getVerifiedPayload();
+    }
+
+    // ══════════════════════════════════════════════════
+    //  License 激活 / 刷新 / 清除
+    // ══════════════════════════════════════════════════
+
+    /**
+     * 使用 License Key 激活并获取 JWT
+     *
+     * 注意：不自动豁免本地环境（D1）。仅在显式设置 DEV_MODE 时才跳过。
+     *
+     * @return array{success: bool, message: string}
+     */
+    public function activate(string $licenseKey, string $email = ''): array
+    {
+        // 格式校验
+        if (! $this->isValidFormat($licenseKey)) {
+            return [
+                'success' => false,
+                'message' => 'License Key 格式无效',
+            ];
+        }
+
+        // 显式开发模式（仅当用户主动设置 DEV_MODE 常量）
+        if ($this->isExplicitDevMode()) {
+            $this->storeConfig($licenseKey, $email, '2099-12-31');
+
+            return [
+                'success' => true,
+                'message' => 'License 激活成功！（开发模式）',
+            ];
+        }
+
+        // 请求 JWT Token
+        $result = $this->requestToken($licenseKey);
+
+        if ($result === null) {
+            return [
+                'success' => false,
+                'message' => '无法连接授权服务器，请检查网络后重试',
+            ];
+        }
+
+        // 业务错误 → 返回具体错误消息
+        if (empty($result['token'])) {
+            $errorCode = $result['error'] ?? 'unknown';
+            $errorMsg  = $result['message'] ?? '激活失败';
+
+            // 常见错误码 → 用户友好消息
+            $friendlyMessages = [
+                'activations_exceeded' => '激活次数已达上限，请先在其他站点解绑',
+                'not_found'            => 'License Key 不存在，请检查是否输入正确',
+                'license_expired'      => 'License 已过期，请续费后重试',
+                'license_suspended'     => 'License 已被停用，请联系客服',
+                'license_cancelled'    => 'License 已被取消',
+                'product_mismatch'     => '此 License Key 与当前产品不匹配',
+                'invalid_format'       => 'License Key 格式无效',
+                'rate_limited'         => $errorMsg,
+            ];
+
+            return [
+                'success' => false,
+                'message' => $friendlyMessages[$errorCode] ?? $errorMsg,
+            ];
+        }
+
+        // 验证 JWT 签名
+        try {
+            $this->verifier->verify($result['token']);
+        } catch (\Exception $e) {
+            return [
+                'success' => false,
+                'message' => 'JWT 签名验证失败: ' . $e->getMessage(),
+            ];
+        }
+
+        // 存储 token 和配置
+        $this->cacheToken($result['token']);
+        $this->storeConfig(
+            $licenseKey,
+            $email,
+            $result['expires_at'],
+            $result['token_version'] ?? 0
+        );
+
+        return [
+            'success' => true,
+            'message' => 'License 激活成功！',
+        ];
+    }
+
+    /**
+     * 清除 License（用户解绑）
+     */
+    public function deactivate(): void
+    {
+        $stored = $this->getStoredConfig();
+        if (! empty($stored['key'])) {
+            $this->callDeactivate($stored['key']);
+        }
+
+        $this->clearLocalState();
+    }
+
+    /**
+     * 强制刷新 JWT Token
+     */
+    public function refresh(): bool
+    {
+        $stored = $this->getStoredConfig();
+        if (empty($stored['key'])) {
+            return false;
+        }
+
+        $result = $this->requestToken($stored['key']);
+        if ($result === null || empty($result['token'])) {
+            return false;
+        }
+
+        try {
+            $this->verifier->verify($result['token']);
+            $this->cacheToken($result['token']);
+
+            // 更新 token_version
+            $this->markTokenVersion($result['token_version'] ?? 0);
+
+            return true;
+        } catch (\Exception $e) {
+            return false;
+        }
+    }
+
+    // ══════════════════════════════════════════════════
+    //  降级策略 — 六级降级链
+    // ══════════════════════════════════════════════════
+
+    /**
+     * 获取并验证 JWT payload（含六级降级）
+     *
+     * 优先级：
+     *   ① 内存缓存
+     *   ② 本地 JWT 缓存（有效期内）
+     *   ③ Grace Period（过期 < 24h）
+     *   ④ 静默刷新
+     *   ⑤ 离线容错（曾激活 + < 7 天离线）
+     *   ⑥ 降级为 Free
+     */
+    private function getVerifiedPayload(): ?object
+    {
+        // ① 内存缓存
+        if ($this->cachedPayload !== null) {
+            return $this->cachedPayload;
+        }
+
+        // ② 从 Laravel cache 读 JWT
+        $token = Cache::get($this->cacheKey);
+
+        if ($token) {
+            try {
+                $this->cachedPayload = $this->verifier->verify($token);
+                // 验证站点绑定
+                $this->verifier->assertSiteMatches(
+                    $this->cachedPayload,
+                    $this->getSiteUrl()
+                );
+
+                return $this->cachedPayload;
+            } catch (JwtExpiredException $e) {
+                // ③ Grace Period 失败 → 尝试刷新
+                $token = null;
+            } catch (JwtSignatureException $e) {
+                // 签名无效 → 不降级，可能代码被篡改
+                return null;
+            } catch (JwtInvalidException $e) {
+                // 站点不匹配等 → 不降级
+                return null;
+            }
+        }
+
+        // ④ 静默刷新
+        if ($this->refresh()) {
+            // 刷新成功，递归调用
+            return $this->getVerifiedPayload();
+        }
+
+        // ⑤ 离线容错
+        return $this->getOfflineFallback();
+    }
+
+    /**
+     * 离线容错 — 当无法连接服务器但用户确实激活过时
+     *
+     * 限制：
+     * - 必须在过去 7 天内有过成功验证
+     * - 返回全部 Pro features（确保正常使用体验）
+     * - 注意：productFeatures 由各插件在自己 FeatureGate 中定义，不在此通用类中硬编码
+     */
+    private function getOfflineFallback(): ?object
+    {
+        $stored = $this->getStoredConfig();
+        if (empty($stored['key']) || empty($stored['activated'])) {
+            return null;
+        }
+
+        // 检查离线超时（7 天）
+        $lastVerified = $stored['last_verified_at'] ?? 0;
+        $offlineMaxSeconds = 7 * 86400;
+
+        if ($lastVerified > 0 && (time() - $lastVerified) > $offlineMaxSeconds) {
+            return null; // ⑤ 离线超过 7 天，不降级 → ⑥ 降为 Free
+        }
+
+        // 返回离线 payload — features 由调用方 FeatureGate 提供
+        return (object) [
+            'features' => [], // 调用方 FeatureGate 应重写 getOfflineFeatures()
+            'plan'     => '',
+            'exp'      => time() + 3600, // 1h 后重试
+            '_offline' => true,
+        ];
+    }
+
+    // ══════════════════════════════════════════════════
+    //  API 通信
+    // ══════════════════════════════════════════════════
+
+    /**
+     * 调用 License Server 获取 JWT
+     *
+     * 返回 null 表示网络不可达/超时（非业务错误）。
+     * 业务错误通过返回数组中的 'error' 字段标识。
+     */
+    private function requestToken(string $licenseKey): ?array
+    {
+        try {
+            $response = Http::timeout(15)
+                ->post(rtrim($this->apiBaseUrl, '/') . '/token', [
+                    'license_key' => $licenseKey,
+                    'site_url'    => $this->getSiteUrl(),
+                    'product'     => $this->productCode,
+                ]);
+
+            // 速率限制
+            if ($response->status() === 429) {
+                $retryAfter = (int) ($response->header('Retry-After') ?? 60);
+
+                return [
+                    'token'  => null,
+                    'error'  => 'rate_limited',
+                    'message' => "请求过于频繁，请 {$retryAfter} 秒后重试",
+                ];
+            }
+
+            $body = $response->json();
+
+            // Pattern 1: VerifyController/HeartbeatController — valid: false
+            if (isset($body['valid']) && $body['valid'] === false) {
+                return [
+                    'token'  => null,
+                    'error'  => $body['error'] ?? 'unknown',
+                    'message' => $body['message'] ?? 'License 验证失败',
+                ];
+            }
+
+            // Pattern 2: ActivateController — success: false
+            if (isset($body['success']) && $body['success'] === false) {
+                return [
+                    'token'  => null,
+                    'error'  => $body['error'] ?? 'unknown',
+                    'message' => $body['message'] ?? '请求失败',
+                ];
+            }
+
+            // Pattern 3: TokenController — raw error field (HTTP 4xx with JSON body)
+            if (! empty($body['error']) && empty($body['token'])) {
+                return [
+                    'token'  => null,
+                    'error'  => $body['error'],
+                    'message' => $body['message'] ?? '验证失败',
+                ];
+            }
+
+            // Pattern 4: HTTP 4xx/5xx without structured JSON error body
+            if (! $response->successful()) {
+                return [
+                    'token'  => null,
+                    'error'  => 'http_error',
+                    'message' => "服务器返回错误 (HTTP {$response->status()})",
+                ];
+            }
+
+            if (empty($body['token'])) {
+                return [
+                    'token'  => null,
+                    'error'  => 'invalid_response',
+                    'message' => '服务器返回了无效的响应',
+                ];
+            }
+
+            // 更新最后验证时间
+            $this->markVerified();
+
+            return [
+                'token'         => $body['token'],
+                'features'      => $body['features'] ?? [],
+                'plan'          => $body['plan'] ?? '',
+                'expires_at'    => $body['expires_at'] ?? '',
+                'token_version' => $body['token_version'] ?? 0,
+            ];
+        } catch (\Exception $e) {
+            return null; // 网络异常
+        }
+    }
+
+    /**
+     * 调用解绑 API
+     */
+    private function callDeactivate(string $key): void
+    {
+        try {
+            $response = Http::timeout(10)
+                ->post(rtrim($this->apiBaseUrl, '/') . '/deactivate', [
+                    'license_key' => $key,
+                    'site_url'    => $this->getSiteUrl(),
+                    'product'     => $this->productCode,
+                ]);
+
+            if ($response->status() === 429) {
+                // 速率限制 — 解绑通常不紧急，静默忽略
+            }
+        } catch (\Exception $e) {
+            // 解绑失败不阻塞本地清除
+        }
+    }
+
+    /**
+     * 调用心跳检测 API
+     *
+     * @return array{valid: bool, token_version: int, features: array, ...}|null
+     */
+    private function callHeartbeat(): ?array
+    {
+        $stored = $this->getStoredConfig();
+        if (empty($stored['key'])) {
+            return null;
+        }
+
+        try {
+            $response = Http::timeout(10)
+                ->post(rtrim($this->apiBaseUrl, '/') . '/heartbeat', [
+                    'license_key' => $stored['key'],
+                    'site_url'    => $this->getSiteUrl(),
+                    'product'     => $this->productCode,
+                ]);
+
+            if ($response->status() === 429) {
+                return ['valid' => true, '_rate_limited' => true, 'token_version' => $stored['token_version'] ?? 0];
+            }
+
+            return $response->json();
+        } catch (\Exception $e) {
+            return null; // 网络不可达，不算吊销
+        }
+    }
+
+    /**
+     * 心跳检测 — 检查 License 状态并检测吊销
+     *
+     * 调用 Server /heartbeat 端点，比较 token_version，
+     * 如发现版本号增大则清除本地状态并抛出 LicenseRevokedException。
+     *
+     * 建议由宿主应用通过定时任务（如 Laravel Scheduler）每 5-30 分钟调用一次。
+     *
+     * @return array{valid: bool, features: array, plan: string, ...}|null
+     *
+     * @throws LicenseRevokedException License 已被服务端吊销
+     */
+    public function heartbeat(): ?array
+    {
+        $stored = $this->getStoredConfig();
+        if (empty($stored['key'])) {
+            return null;
+        }
+
+        $response = $this->callHeartbeat();
+
+        if ($response === null) {
+            return null; // 网络不可达 — 不做任何变更
+        }
+
+        // 速率限制 — 跳过本轮
+        if (! empty($response['_rate_limited'])) {
+            return $response;
+        }
+
+        // 检查吊销
+        $serverVersion = (int) ($response['token_version'] ?? 0);
+        $localVersion  = (int) ($stored['token_version'] ?? 0);
+
+        if ($response['valid'] === false && ($response['error'] ?? '') === 'license_suspended') {
+            $this->clearLocalState();
+            throw new LicenseRevokedException(
+                $response['message'] ?? 'License 已被吊销，请联系客服'
+            );
+        }
+
+        // token_version 增大 → License 经历了一次吊销-恢复
+        if ($serverVersion > $localVersion && $localVersion > 0) {
+            $this->clearLocalState();
+            throw new LicenseRevokedException(
+                'License 状态已变更（token_version ' . $localVersion . ' → ' . $serverVersion . '），请重新激活'
+            );
+        }
+
+        // 更新本地 token_version
+        if ($serverVersion > $localVersion) {
+            $this->markTokenVersion($serverVersion);
+        }
+
+        // 更新最后验证时间
+        $this->markVerified();
+
+        return $response;
+    }
+
+    // ══════════════════════════════════════════════════
+    //  缓存与存储
+    // ══════════════════════════════════════════════════
+
+    private function cacheToken(string $token): void
+    {
+        Cache::put($this->cacheKey, $token, $this->tokenTtl);
+        $this->cachedPayload = null; // 清除内存缓存，下次重新验证
+    }
+
+    private function storeConfig(string $key, string $email, string $expiresAt, int $tokenVersion = 0): void
+    {
+        Cache::forever($this->configKey, [
+            'key'              => $key,
+            'email'            => $email,
+            'activated'        => true,
+            'expires_at'       => $expiresAt,
+            'token_version'    => $tokenVersion,
+            'last_verified_at' => time(),
+        ]);
+    }
+
+    private function getStoredConfig(): array
+    {
+        return Cache::get($this->configKey, [
+            'key'              => '',
+            'email'            => '',
+            'activated'        => false,
+            'expires_at'       => '',
+            'token_version'    => 0,
+            'last_verified_at' => 0,
+        ]);
+    }
+
+    /**
+     * 获取已存储的 token_version（用于吊销检测）
+     */
+    public function getStoredTokenVersion(): int
+    {
+        $config = $this->getStoredConfig();
+
+        return (int) ($config['token_version'] ?? 0);
+    }
+
+    private function markVerified(): void
+    {
+        $config = $this->getStoredConfig();
+        $config['last_verified_at'] = time();
+        Cache::forever($this->configKey, $config);
+    }
+
+    /**
+     * 更新已存储的 token_version
+     */
+    private function markTokenVersion(int $version): void
+    {
+        $config = $this->getStoredConfig();
+        if (! empty($config['key'])) {
+            $config['token_version'] = $version;
+            Cache::forever($this->configKey, $config);
+        }
+    }
+
+    private function clearLocalState(): void
+    {
+        Cache::forget($this->cacheKey);
+        Cache::forget($this->configKey);
+        $this->cachedPayload = null;
+    }
+
+    // ══════════════════════════════════════════════════
+    //  辅助方法
+    // ══════════════════════════════════════════════════
+
+    /**
+     * 格式校验（每个产品自定义格式）
+     *
+     * License Key 格式：{PRODUCT_PREFIX}-XXXX-XXXX-XXXX-XXXX
+     * 字符集与 Server 对齐：排除易混淆字符 0/O/I/L
+     *
+     * 子类可 override 此方法。
+     */
+    protected function isValidFormat(string $key): bool
+    {
+        $prefix = preg_quote($this->keyPrefix, '/');
+
+        return (bool) preg_match(
+            '/^' . $prefix . '-[A-HJKMNP-Z1-9]{4}-[A-HJKMNP-Z1-9]{4}-[A-HJKMNP-Z1-9]{4}-[A-HJKMNP-Z1-9]{4}$/',
+            $key
+        );
+    }
+
+    /**
+     * 显式开发模式
+     *
+     * D1: 不自动检测 localhost/.test/私网IP。
+     * 仅当用户主动定义了常量才放行。
+     */
+    protected function isExplicitDevMode(): bool
+    {
+        return defined('RAISE_LICENSE_DEV_MODE') && RAISE_LICENSE_DEV_MODE === true;
+    }
+
+    /**
+     * 获取存储的 License Key
+     */
+    public function getStoredLicenseKey(): ?string
+    {
+        $config = $this->getStoredConfig();
+
+        return $config['activated'] ? ($config['key'] ?? null) : null;
+    }
+}
