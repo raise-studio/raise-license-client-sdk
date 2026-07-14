@@ -5,6 +5,9 @@ namespace RaiseStudio\License;
 use RaiseStudio\License\Contracts\CacheInterface;
 use RaiseStudio\License\Contracts\HttpClientInterface;
 use RaiseStudio\License\Contracts\LoggerInterface;
+use RaiseStudio\License\Exceptions\JwtExpiredException;
+use RaiseStudio\License\Exceptions\JwtInvalidException;
+use RaiseStudio\License\Exceptions\JwtSignatureException;
 use RaiseStudio\License\Exceptions\LicenseRevokedException;
 
 class LicenseClient

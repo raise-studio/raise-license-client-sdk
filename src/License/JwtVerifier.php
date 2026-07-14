@@ -5,6 +5,9 @@ namespace RaiseStudio\License;
 use Firebase\JWT\JWT;
 use Firebase\JWT\Key;
 use RaiseStudio\License\Contracts\LoggerInterface;
+use RaiseStudio\License\Exceptions\JwtExpiredException;
+use RaiseStudio\License\Exceptions\JwtInvalidException;
+use RaiseStudio\License\Exceptions\JwtSignatureException;
 
 class JwtVerifier
 {

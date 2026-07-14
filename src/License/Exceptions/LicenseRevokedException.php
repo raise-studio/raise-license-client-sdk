@@ -1,6 +1,6 @@
 <?php
 
-namespace RaiseStudio\License;
+namespace RaiseStudio\License\Exceptions;
 
 /**
  * Thrown when the license has been revoked by the server.

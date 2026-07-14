@@ -1,6 +1,6 @@
 <?php
 
-namespace RaiseStudio\License;
+namespace RaiseStudio\License\Exceptions;
 
 /**
  * Thrown when JWT has expired beyond the Grace Period.

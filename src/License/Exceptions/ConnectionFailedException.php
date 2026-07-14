@@ -1,6 +1,6 @@
 <?php
 
-namespace RaiseStudio\License;
+namespace RaiseStudio\License\Exceptions;
 
 /**
  * Thrown when network connection to License Server is unreachable.

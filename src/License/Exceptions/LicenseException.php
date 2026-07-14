@@ -1,6 +1,6 @@
 <?php
 
-namespace RaiseStudio\License;
+namespace RaiseStudio\License\Exceptions;
 
 /**
  * Base exception for all License SDK errors.
