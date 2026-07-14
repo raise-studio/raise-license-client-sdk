@@ -3,6 +3,20 @@
     "description": "Standardized PHP SDK for Raise Studio product license gating",
     "type": "library",
     "license": "proprietary",
+    "keywords": ["raise-studio", "license", "sdk", "jwt"],
+    "homepage": "https://www.raisestudio.dev",
+    "support": {
+        "email": "support@raisestudio.dev",
+        "issues": "https://github.com/raise-studio/raise-license-client-sdk/issues",
+        "source": "https://github.com/raise-studio/raise-license-client-sdk"
+    },
+    "authors": [
+        {
+            "name": "Raise Studio",
+            "email": "support@raisestudio.dev",
+            "homepage": "https://www.raisestudio.dev"
+        }
+    ],
     "autoload": {
         "psr-4": {
             "RaiseStudio\\License\\": "src/License/",
