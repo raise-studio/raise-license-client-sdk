@@ -125,7 +125,7 @@ class FeatureGate
             return $this->allProFeatures;
         }
 
-        return $payload ? ($payload->features ?? []) : [];
+        return $payload ? LicenseClient::normalizeFeatures($payload->features ?? []) : [];
     }
 
     /**

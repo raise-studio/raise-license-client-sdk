@@ -107,7 +107,52 @@ class LicenseClient
     {
         $payload = $this->getVerifiedPayload();
 
-        return $payload ? ($payload->features ?? []) : [];
+        return $payload ? self::normalizeFeatures($payload->features ?? []) : [];
+    }
+
+    /**
+     * 将 features 字段统一规范化为数组。
+     *
+     * 兼容以下来源（License Server 在某些异常情况下可能返回非数组）：
+     *   - 数组（正常情况）
+     *   - JSON 字符串（如 '["a","b"]' 或 '["a", "b"]'）
+     *   - 逗号分隔字符串（如 'a,b,c'）
+     *   - 其它标量（如空字符串 / 单个字符串）→ 归一为数组
+     *
+     * 防止 count() / in_array() 在 PHP 8 下因传入非 Countable|array 抛出 TypeError。
+     */
+    public static function normalizeFeatures(mixed $features): array
+    {
+        if (is_array($features)) {
+            return $features;
+        }
+
+        if (is_string($features)) {
+            $trimmed = trim($features);
+            if ($trimmed === '') {
+                return [];
+            }
+
+            // 尝试 JSON 解码（JWT payload / API 响应里最可能是 JSON 数组字符串）
+            $decoded = json_decode($trimmed, true);
+            if (is_array($decoded)) {
+                return $decoded;
+            }
+
+            // 退化为逗号分隔
+            if (str_contains($trimmed, ',')) {
+                return array_values(array_filter(
+                    array_map('trim', explode(',', $trimmed)),
+                    fn ($v) => $v !== ''
+                ));
+            }
+
+            // 单个功能名
+            return [$trimmed];
+        }
+
+        // 其它类型（int/bool/null/object）→ 空数组，避免下游报错
+        return [];
     }
 
     /**
@@ -555,24 +600,26 @@ class LicenseClient
             // 更新最后验证时间
             $this->markVerified();
 
+            $features = self::normalizeFeatures($body['features'] ?? []);
+
             $this->logger->info('requestToken: success', [
                 'plan'          => $body['plan'] ?? '',
                 'expires_at'    => $body['expires_at'] ?? '',
                 'token_version' => $body['token_version'] ?? 0,
-                'feature_count' => count($body['features'] ?? []),
+                'feature_count' => count($features),
             ]);
 
             return [
                 'token'         => $body['token'],
-                'features'      => $body['features'] ?? [],
+                'features'      => $features,
                 'plan'          => $body['plan'] ?? '',
                 'expires_at'    => $body['expires_at'] ?? '',
                 'token_version' => $body['token_version'] ?? 0,
             ];
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $this->logger->error('requestToken: exception', ['detail' => $e->getMessage()]);
 
-            return null; // 网络异常
+            return null; // 网络异常 / 解析异常
         }
     }
 
