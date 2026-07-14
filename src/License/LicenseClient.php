@@ -859,6 +859,32 @@ class LicenseClient
         // 更新最后验证时间
         $this->markVerified();
 
+        // ───────────────────────────────────────────────
+        //  自动同步 grant 变化（无需手动清缓存）
+        // ───────────────────────────────────────────────
+        //  仅当心跳响应确实返回 features 字段、且 license 处于有效状态时比对，避免：
+        //   ① 服务端未提供该字段时误判为"变化" → 每次心跳都刷新（无谓请求/限流）；
+        //   ② license 已失效时还去刷新。
+        //  命中条件：服务端下发的 features 集合 ≠ 本地已缓存 JWT 的 features 集合
+        //  （新增/移除功能均算变化）。变化即自动 refresh() 拉取新 token，
+        //  使 grant（及功能级吊销）至多延迟一个心跳周期生效。
+        if (isset($response['features']) && ($response['valid'] ?? true) !== false) {
+            $serverFeatures = self::normalizeFeatures($response['features']);
+            $localFeatures  = $this->getFeatures();
+            $changed = array_diff($serverFeatures, $localFeatures) || array_diff($localFeatures, $serverFeatures);
+            if ($changed) {
+                $this->logger->info('heartbeat: server features changed, auto-refresh token', [
+                    'local'  => $localFeatures,
+                    'server' => $serverFeatures,
+                ]);
+                if ($this->refresh()) {
+                    $this->logger->info('heartbeat: token refreshed, features synced');
+                } else {
+                    $this->logger->warning('heartbeat: auto-refresh failed, keep cached token until next cycle');
+                }
+            }
+        }
+
         $this->logger->info('heartbeat: OK', ['valid' => $response['valid'] ?? null]);
 
         return $response;
