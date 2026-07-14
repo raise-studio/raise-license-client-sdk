@@ -115,15 +115,18 @@ class FeatureGate
             return '';
         }
 
+        $html = '<div class="raise-upgrade-notice">'
+              . '<p>%s <strong>%s</strong> %s</p>'
+              . '<a href="%s" target="_blank" class="raise-btn raise-btn-primary">%s</a>'
+              . '</div>';
+
         return sprintf(
-            '<div class="raise-upgrade-notice">
-                <p>🔒 <strong>%s</strong> 是 Pro 版本功能。</p>
-                <a href="%s" target="_blank" class="raise-btn raise-btn-primary">
-                    升级到 Pro
-                </a>
-             </div>',
+            $html,
+            '🔒',
             $featureName,
-            $pricingUrl
+            Messages::get('feature.upgrade_notice.is_pro_feature'),
+            $pricingUrl,
+            Messages::get('feature.upgrade_notice.upgrade_btn'),
         );
     }
 

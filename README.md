@@ -179,10 +179,27 @@ $client = new LicenseClient(
 return [
     'product_code'      => 'raise-import',
     'public_key_base64' => 'YOUR_PUBLIC_KEY_BASE64',
-    'api_base_url'      => 'https://license.raise-studio.com/api/v1',
+    'api_base_url'      => 'https://admin.raisestudio.dev/api/v1',
     'free_features'     => ['basic_import', 'csv_support'],
     'all_pro_features'  => ['pipeline', 'advanced_mapping', 'queue'],
 ];
+```
+
+## 多语言
+
+SDK 错误消息支持多语言，默认语言为英文。切换到中文只需一行：
+
+```php
+use RaiseStudio\License\Messages;
+
+// 切换到中文
+Messages::setLocale('zh');
+
+// 或注入自定义翻译
+Messages::add('fr', [
+    'activation.invalid_format' => 'Format de clé de licence invalide.',
+    // ...
+]);
 ```
 
 ## 降级策略

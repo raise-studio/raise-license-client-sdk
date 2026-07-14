@@ -30,12 +30,6 @@ class LicenseClient
     /** 单次请求内的内存缓存 */
     private ?object $cachedPayload = null;
 
-    /** License Key 前缀映射（productCode → 前缀） */
-    private const KEY_PREFIX_MAP = [
-        'raise-import' => 'RI',
-        'raise-media'  => 'RM',
-    ];
-
     /**
      * 构造函数
      *
@@ -45,7 +39,6 @@ class LicenseClient
      * @param HttpClientInterface $http            HTTP 客户端实现
      * @param string|null         $apiBaseUrl      License Server API 地址
      * @param string|null         $siteUrl          当前站点 URL
-     * @param string|null         $keyPrefix       License Key 前缀（null 时从 KEY_PREFIX_MAP 自动推导）
      */
     public function __construct(
         private readonly string $productCode,
@@ -54,19 +47,14 @@ class LicenseClient
         HttpClientInterface $http,
         ?string $apiBaseUrl = null,
         ?string $siteUrl = null,
-        ?string $keyPrefix = null,
     ) {
         $this->cache = $cache;
         $this->http = $http;
 
-        $this->keyPrefix = $keyPrefix
-            ?? self::KEY_PREFIX_MAP[$productCode]
-            ?? strtoupper(substr($productCode, 0, 2));
-
         $this->cacheKey = "raise_license:{$productCode}:jwt";
         $this->configKey = "raise_license:{$productCode}:config";
         $this->apiBaseUrl = $apiBaseUrl
-            ?? 'https://license.raise-studio.com/api/v1';
+            ?? 'https://admin.raisestudio.dev/api/v1';
 
         // 站点 URL 由调用方显式传入，不依赖框架 helper
         $this->siteUrl = $siteUrl ?? $this->detectSiteUrl();
@@ -146,21 +134,13 @@ class LicenseClient
      */
     public function activate(string $licenseKey, string $email = ''): array
     {
-        // 格式校验
-        if (! $this->isValidFormat($licenseKey)) {
-            return [
-                'success' => false,
-                'message' => 'License Key 格式无效',
-            ];
-        }
-
         // 显式开发模式（仅当用户主动设置 DEV_MODE 常量）
         if ($this->isExplicitDevMode()) {
             $this->storeConfig($licenseKey, $email, '2099-12-31');
 
             return [
                 'success' => true,
-                'message' => 'License 激活成功！（开发模式）',
+                'message' => Messages::get('activation.success_dev_mode'),
             ];
         }
 
@@ -170,24 +150,24 @@ class LicenseClient
         if ($result === null) {
             return [
                 'success' => false,
-                'message' => '无法连接授权服务器，请检查网络后重试',
+                'message' => Messages::get('activation.connection_failed'),
             ];
         }
 
         // 业务错误 → 返回具体错误消息
         if (empty($result['token'])) {
             $errorCode = $result['error'] ?? 'unknown';
-            $errorMsg  = $result['message'] ?? '激活失败';
+            $errorMsg  = $result['message'] ?? Messages::get('activation.failed');
 
             // 常见错误码 → 用户友好消息
             $friendlyMessages = [
-                'activations_exceeded' => '激活次数已达上限，请先在其他站点解绑',
-                'not_found'            => 'License Key 不存在，请检查是否输入正确',
-                'license_expired'      => 'License 已过期，请续费后重试',
-                'license_suspended'     => 'License 已被停用，请联系客服',
-                'license_cancelled'    => 'License 已被取消',
-                'product_mismatch'     => '此 License Key 与当前产品不匹配',
-                'invalid_format'       => 'License Key 格式无效',
+                'activations_exceeded' => Messages::get('activation.activations_exceeded'),
+                'not_found'            => Messages::get('activation.not_found'),
+                'license_expired'      => Messages::get('activation.license_expired'),
+                'license_suspended'    => Messages::get('activation.license_suspended'),
+                'license_cancelled'    => Messages::get('activation.license_cancelled'),
+                'product_mismatch'     => Messages::get('activation.product_mismatch'),
+                'invalid_format'       => Messages::get('activation.invalid_format'),
                 'rate_limited'         => $errorMsg,
             ];
 
@@ -203,7 +183,7 @@ class LicenseClient
         } catch (\Exception $e) {
             return [
                 'success' => false,
-                'message' => 'JWT 签名验证失败: ' . $e->getMessage(),
+                'message' => Messages::get('activation.jwt_signature_failed', $e->getMessage()),
             ];
         }
 
@@ -218,7 +198,7 @@ class LicenseClient
 
         return [
             'success' => true,
-            'message' => 'License 激活成功！',
+            'message' => Messages::get('activation.success'),
         ];
     }
 
@@ -387,7 +367,7 @@ class LicenseClient
                 return [
                     'token'  => null,
                     'error'  => 'rate_limited',
-                    'message' => "请求过于频繁，请 {$retryAfter} 秒后重试",
+                    'message' => Messages::get('server.rate_limited', $retryAfter),
                 ];
             }
 
@@ -398,7 +378,7 @@ class LicenseClient
                 return [
                     'token'  => null,
                     'error'  => $body['error'] ?? 'unknown',
-                    'message' => $body['message'] ?? 'License 验证失败',
+                    'message' => $body['message'] ?? Messages::get('server.verification_failed'),
                 ];
             }
 
@@ -407,7 +387,7 @@ class LicenseClient
                 return [
                     'token'  => null,
                     'error'  => $body['error'] ?? 'unknown',
-                    'message' => $body['message'] ?? '请求失败',
+                    'message' => $body['message'] ?? Messages::get('server.request_failed'),
                 ];
             }
 
@@ -416,7 +396,7 @@ class LicenseClient
                 return [
                     'token'  => null,
                     'error'  => $body['error'],
-                    'message' => $body['message'] ?? '验证失败',
+                    'message' => $body['message'] ?? Messages::get('server.validation_failed'),
                 ];
             }
 
@@ -425,7 +405,7 @@ class LicenseClient
                 return [
                     'token'  => null,
                     'error'  => 'http_error',
-                    'message' => "服务器返回错误 (HTTP {$response->statusCode})",
+                    'message' => Messages::get('server.http_error', $response->statusCode),
                 ];
             }
 
@@ -433,7 +413,7 @@ class LicenseClient
                 return [
                     'token'  => null,
                     'error'  => 'invalid_response',
-                    'message' => '服务器返回了无效的响应',
+                    'message' => Messages::get('server.invalid_response'),
                 ];
             }
 
@@ -546,7 +526,7 @@ class LicenseClient
         if ($response['valid'] === false && ($response['error'] ?? '') === 'license_suspended') {
             $this->clearLocalState();
             throw new LicenseRevokedException(
-                $response['message'] ?? 'License 已被吊销，请联系客服'
+                $response['message'] ?? Messages::get('heartbeat.revoked')
             );
         }
 
@@ -554,7 +534,7 @@ class LicenseClient
         if ($serverVersion > $localVersion && $localVersion > 0) {
             $this->clearLocalState();
             throw new LicenseRevokedException(
-                'License 状态已变更（token_version ' . $localVersion . ' → ' . $serverVersion . '），请重新激活'
+                Messages::get('heartbeat.token_version_changed', $localVersion, $serverVersion)
             );
         }
 
@@ -642,24 +622,6 @@ class LicenseClient
     // ══════════════════════════════════════════════════
     //  辅助方法
     // ══════════════════════════════════════════════════
-
-    /**
-     * 格式校验（每个产品自定义格式）
-     *
-     * License Key 格式：{PRODUCT_PREFIX}-XXXX-XXXX-XXXX-XXXX
-     * 字符集与 Server 对齐：排除易混淆字符 0/O/I/L
-     *
-     * 子类可 override 此方法。
-     */
-    protected function isValidFormat(string $key): bool
-    {
-        $prefix = preg_quote($this->keyPrefix, '/');
-
-        return (bool) preg_match(
-            '/^' . $prefix . '-[A-HJKMNP-Z1-9]{4}-[A-HJKMNP-Z1-9]{4}-[A-HJKMNP-Z1-9]{4}-[A-HJKMNP-Z1-9]{4}$/',
-            $key
-        );
-    }
 
     /**
      * 显式开发模式

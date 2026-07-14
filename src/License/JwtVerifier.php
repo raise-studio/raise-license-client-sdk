@@ -69,11 +69,11 @@ class JwtVerifier
             return $this->verifyWithGracePeriod($token);
         } catch (\Firebase\JWT\SignatureInvalidException $e) {
             throw new JwtSignatureException(
-                'JWT 签名无效，疑似被篡改。请联系技术支持。'
+                Messages::get('jwt.signature_invalid')
             );
         } catch (\Exception $e) {
             throw new JwtInvalidException(
-                'JWT 验证失败: ' . $e->getMessage()
+                Messages::get('jwt.verification_failed', $e->getMessage())
             );
         }
     }
@@ -97,7 +97,7 @@ class JwtVerifier
             $expiredSince = time() - $payload->exp;
             if ($expiredSince > $this->gracePeriod) {
                 throw new JwtExpiredException(
-                    'JWT 已过期超过 ' . ($this->gracePeriod / 3600) . ' 小时'
+                    Messages::get('jwt.expired_grace_period', (int) ($this->gracePeriod / 3600))
                 );
             }
 
@@ -108,7 +108,7 @@ class JwtVerifier
             throw $e;
         } catch (\Exception $e) {
             throw new JwtSignatureException(
-                'JWT 签名验证失败（Grace Period）: ' . $e->getMessage()
+                Messages::get('jwt.grace_period_signature_failed', $e->getMessage())
             );
         }
     }
@@ -120,8 +120,7 @@ class JwtVerifier
     {
         if (($payload->product ?? '') !== $this->productCode) {
             throw new JwtInvalidException(
-                'JWT 产品不匹配: expected ' . $this->productCode
-                . ', got ' . ($payload->product ?? 'null')
+                Messages::get('jwt.product_mismatch', $this->productCode, $payload->product ?? 'null')
             );
         }
     }
@@ -138,7 +137,7 @@ class JwtVerifier
 
         if (! hash_equals($expected, $actual)) {
             throw new JwtInvalidException(
-                'JWT 绑定的站点与当前站点不匹配'
+                Messages::get('jwt.site_mismatch')
             );
         }
     }
