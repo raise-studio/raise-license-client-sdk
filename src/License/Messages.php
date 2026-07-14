@@ -201,6 +201,10 @@ class Messages
                 'en' => 'JWT site binding does not match the current site.',
                 'zh' => 'JWT 绑定的站点与当前站点不匹配',
             ],
+            'jwt.public_key_missing' => [
+                'en' => 'License public key is not configured. Set RAISE_IMPORT_PUBLIC_KEY to your license server\'s JWT_PUBLIC_KEY.',
+                'zh' => '未配置 License 公钥，请在 .env 设置 RAISE_IMPORT_PUBLIC_KEY（值为授权服务器的 JWT_PUBLIC_KEY）。',
+            ],
 
             // ── Feature Gate ─────────────────────────────────
             'feature.upgrade_notice.is_pro_feature' => [

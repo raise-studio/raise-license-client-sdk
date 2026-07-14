@@ -126,6 +126,10 @@ class JwtVerifier
             throw new JwtSignatureException(
                 Messages::get('jwt.signature_invalid')
             );
+        } catch (JwtInvalidException $e) {
+            // Already a precise, actionable error (e.g. public key not
+            // configured) — re-throw as-is without re-wrapping.
+            throw $e;
         } catch (\Exception $e) {
             $this->logger->error('JWT verification failed', [
                 'detail' => $e->getMessage(),
@@ -250,7 +254,17 @@ class JwtVerifier
      */
     private function getPublicKey(): string
     {
-        return base64_decode($this->publicKeyBase64);
+        $key = base64_decode($this->publicKeyBase64, true);
+
+        if ($key === false || $key === '') {
+            // Empty/garbled key → fail loud with an actionable message instead
+            // of a cryptic Firebase "Key material must not be empty".
+            throw new JwtInvalidException(
+                Messages::get('jwt.public_key_missing')
+            );
+        }
+
+        return $key;
     }
 
     /**
