@@ -41,6 +41,13 @@ class JwtVerifier
      */
     private LoggerInterface $logger;
 
+    /**
+     * 锁定的公钥指纹（SHA-256，大写十六进制）。
+     * 为空表示未锁定（TOFU：首次信任服务器下发的公钥）。
+     * 设置后，服务器下发的公钥指纹必须与之匹配，否则拒绝（抗中间人）。
+     */
+    private string $pinnedFingerprint = '';
+
     public function __construct(string $productCode, string $publicKeyBase64)
     {
         $this->productCode = $productCode;
@@ -56,6 +63,39 @@ class JwtVerifier
         $this->logger = $logger;
 
         return $this;
+    }
+
+    /**
+     * 锁定受信任的公钥指纹（SHA-256，大写十六进制）。
+     * 设置后，服务器下发的公钥指纹必须与之匹配，否则验签拒绝。
+     */
+    public function setPinnedFingerprint(string $fingerprint): self
+    {
+        $this->pinnedFingerprint = strtoupper(trim($fingerprint));
+
+        return $this;
+    }
+
+    /**
+     * 运行时替换验签公钥（base64 PEM）。
+     * 用于接受 License Server 在响应中下发的自身公钥（部署自愈）。
+     */
+    public function setPublicKeyBase64(string $publicKeyBase64): self
+    {
+        $this->publicKeyBase64 = $publicKeyBase64;
+
+        return $this;
+    }
+
+    /**
+     * 计算给定 base64 公钥的指纹（SHA-256，大写十六进制）。
+     * 指纹基于解码后的 PEM 明文，与具体 base64 包装无关。
+     */
+    public static function fingerprintOf(string $publicKeyBase64): string
+    {
+        $pem = base64_decode($publicKeyBase64, true);
+
+        return strtoupper(hash('sha256', (string) $pem));
     }
 
     /**

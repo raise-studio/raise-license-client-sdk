@@ -205,6 +205,10 @@ class Messages
                 'en' => 'License public key is not configured. Set RAISE_IMPORT_PUBLIC_KEY to your license server\'s JWT_PUBLIC_KEY.',
                 'zh' => '未配置 License 公钥，请在 .env 设置 RAISE_IMPORT_PUBLIC_KEY（值为授权服务器的 JWT_PUBLIC_KEY）。',
             ],
+            'jwt.public_key_fingerprint_mismatch' => [
+                'en' => 'The public key returned by the License Server does not match the pinned fingerprint. This may indicate a man-in-the-middle attack or tampered configuration. Contact technical support.',
+                'zh' => '授权服务器返回的公钥指纹与本地锁定值不符，疑似中间人攻击或配置被篡改。请联系技术支持。',
+            ],
 
             // ── Feature Gate ─────────────────────────────────
             'feature.upgrade_notice.is_pro_feature' => [

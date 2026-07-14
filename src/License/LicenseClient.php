@@ -37,6 +37,12 @@ class LicenseClient
     /** 排障日志器（默认静默） */
     private LoggerInterface $logger;
 
+    /** 锁定的公钥指纹（SHA-256，大写）；空=未锁定(TOFU) */
+    private string $pinnedFingerprint = '';
+
+    /** 服务器下发的公钥缓存 key（供离线复用，避免重新依赖配置公钥） */
+    private string $pubKeyCacheKey;
+
     /**
      * 构造函数
      *
@@ -56,13 +62,16 @@ class LicenseClient
         ?string $apiBaseUrl = null,
         ?string $siteUrl = null,
         ?LoggerInterface $logger = null,
+        ?string $pinnedFingerprint = null,
     ) {
         $this->cache = $cache;
         $this->http = $http;
         $this->logger = $logger ?? new NullLogger();
+        $this->pinnedFingerprint = strtoupper(trim((string) $pinnedFingerprint));
 
         $this->cacheKey = "raise_license:{$productCode}:jwt";
         $this->configKey = "raise_license:{$productCode}:config";
+        $this->pubKeyCacheKey = "raise_license:{$productCode}:pubkey";
         $this->apiBaseUrl = $apiBaseUrl
             ?? 'https://admin.raisestudio.dev/api/v1';
 
@@ -74,6 +83,14 @@ class LicenseClient
             $this->publicKeyBase64
         );
         $this->verifier->setLogger($this->logger);
+
+        // 预加载已缓存的服务器公钥：使离线/后续请求用正确的密钥验签，
+        // 而不必回退到可能不匹配的配置公钥。
+        $cachedPub = $this->cache->get($this->pubKeyCacheKey);
+        if (is_string($cachedPub) && $cachedPub !== '') {
+            $this->verifier->setPublicKeyBase64($cachedPub);
+            $this->logger->debug('constructor: preloaded cached server public key');
+        }
     }
 
     /**
@@ -600,6 +617,12 @@ class LicenseClient
                 ];
             }
 
+            // 接受服务器下发的公钥（指纹校验 + 缓存 + 设置验签密钥）
+            $keyError = $this->acceptServerPublicKey($body['public_key'] ?? null);
+            if ($keyError !== null) {
+                return $keyError;
+            }
+
             // 更新最后验证时间
             $this->markVerified();
 
@@ -624,6 +647,58 @@ class LicenseClient
 
             return null; // 网络异常 / 解析异常
         }
+    }
+
+    /**
+     * 接受 License Server 在响应中下发的自身公钥。
+     *
+     * 处理顺序：
+     *   1. 解码 base64 → PEM，校验基本合法性
+     *   2. 若锁定了指纹，计算下发公钥指纹并与锁定值比对（抗中间人）
+     *   3. 通过 → 设置为当前验签公钥，并永久缓存（供离线/后续请求复用）
+     *
+     * @return array|null 指纹不匹配时返回错误数组；成功、缺失或非法时返回 null（缺失/非法则回退配置公钥）
+     */
+    private function acceptServerPublicKey(?string $serverKeyB64): ?array
+    {
+        if ($serverKeyB64 === null || $serverKeyB64 === '') {
+            // 服务器未下发公钥（旧版本）→ 回退到配置公钥，不报错
+            $this->logger->debug('acceptServerPublicKey: server did not provide public_key, fallback to config key');
+
+            return null;
+        }
+
+        $pem = base64_decode($serverKeyB64, true);
+        if ($pem === false || ! str_contains($pem, 'PUBLIC KEY')) {
+            $this->logger->warning('acceptServerPublicKey: server public_key is not valid PEM, fallback to config key');
+
+            return null;
+        }
+
+        // 指纹锁定校验（抗中间人）
+        if ($this->pinnedFingerprint !== '') {
+            $fp = JwtVerifier::fingerprintOf($serverKeyB64);
+            if (! hash_equals($this->pinnedFingerprint, $fp)) {
+                $this->logger->error('acceptServerPublicKey: public key fingerprint mismatch (possible MITM / config tamper)', [
+                    'expected' => $this->mask($this->pinnedFingerprint, 6),
+                    'actual'   => $this->mask($fp, 6),
+                ]);
+
+                return [
+                    'token'  => null,
+                    'error'  => 'public_key_mismatch',
+                    'message' => Messages::get('jwt.public_key_fingerprint_mismatch'),
+                ];
+            }
+        }
+
+        // 通过：使用服务器公钥验签，并缓存供离线复用
+        $this->verifier->setPublicKeyBase64($serverKeyB64);
+        $this->cache->forever($this->pubKeyCacheKey, $serverKeyB64);
+        $this->logger->info('acceptServerPublicKey: server public key accepted'
+            . ($this->pinnedFingerprint !== '' ? ' (fingerprint pinned)' : ' (TOFU)'));
+
+        return null;
     }
 
     /**
@@ -856,6 +931,7 @@ class LicenseClient
     {
         $this->cache->forget($this->cacheKey);
         $this->cache->forget($this->configKey);
+        $this->cache->forget($this->pubKeyCacheKey);
         $this->cachedPayload = null;
     }
 
@@ -915,5 +991,20 @@ class LicenseClient
         $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost';
 
         return rtrim("{$scheme}://{$host}", '/');
+    }
+
+    /**
+     * 安全脱敏：仅保留首尾各 $visible 个字符，避免日志泄露密钥/指纹明文。
+     */
+    private function mask(string $value, int $visible = 4): string
+    {
+        $len = strlen($value);
+        if ($len <= $visible * 2) {
+            return str_repeat('*', $len);
+        }
+
+        return substr($value, 0, $visible)
+            . str_repeat('*', $len - $visible * 2)
+            . substr($value, -$visible);
     }
 }
