@@ -4,6 +4,7 @@ namespace RaiseStudio\License;
 
 use Firebase\JWT\JWT;
 use Firebase\JWT\Key;
+use RaiseStudio\License\Contracts\LoggerInterface;
 
 class JwtVerifier
 {
@@ -32,10 +33,41 @@ class JwtVerifier
      */
     private int $leeway = 60;
 
+    /**
+     * 排障日志器（默认静默）
+     */
+    private LoggerInterface $logger;
+
     public function __construct(string $productCode, string $publicKeyBase64)
     {
         $this->productCode = $productCode;
         $this->publicKeyBase64 = $publicKeyBase64;
+        $this->logger = new NullLogger();
+    }
+
+    /**
+     * 注入排障日志器（排查问题时使用）。
+     */
+    public function setLogger(LoggerInterface $logger): self
+    {
+        $this->logger = $logger;
+
+        return $this;
+    }
+
+    /**
+     * 安全脱敏：仅保留首尾各 4 个字符，避免日志泄露密钥/Token 明文。
+     */
+    private function mask(string $value, int $visible = 4): string
+    {
+        $len = strlen($value);
+        if ($len <= $visible * 2) {
+            return str_repeat('*', $len);
+        }
+
+        return substr($value, 0, $visible)
+            . str_repeat('*', $len - $visible * 2)
+            . substr($value, -$visible);
     }
 
     /**
@@ -53,6 +85,13 @@ class JwtVerifier
         $publicKey = $this->getPublicKey();
         JWT::$leeway = $this->leeway;
 
+        $this->logger->debug('JWT verify start', [
+            'token_len'   => strlen($token),
+            'product'     => $this->productCode,
+            'leeway'      => $this->leeway,
+            'grace_period'=> $this->gracePeriod,
+        ]);
+
         try {
             // 第一遍：严格验证（签名 + 过期 + leeway）
             $payload = JWT::decode(
@@ -63,15 +102,32 @@ class JwtVerifier
             // 验证产品匹配
             $this->assertProductMatches($payload);
 
+            $this->logger->info('JWT strict verification passed', [
+                'product' => $payload->product ?? null,
+                'exp'     => $payload->exp ?? null,
+            ]);
+
             return $payload;
         } catch (\Firebase\JWT\ExpiredException $e) {
             // JWT 已过期，尝试 Grace Period
+            $this->logger->warning('JWT expired, entering Grace Period check', [
+                'exp' => $payload->exp ?? null,
+            ]);
+
             return $this->verifyWithGracePeriod($token);
         } catch (\Firebase\JWT\SignatureInvalidException $e) {
+            $this->logger->error('JWT signature invalid (tamper suspected)', [
+                'detail' => $e->getMessage(),
+            ]);
+
             throw new JwtSignatureException(
                 Messages::get('jwt.signature_invalid')
             );
         } catch (\Exception $e) {
+            $this->logger->error('JWT verification failed', [
+                'detail' => $e->getMessage(),
+            ]);
+
             throw new JwtInvalidException(
                 Messages::get('jwt.verification_failed', $e->getMessage())
             );
@@ -85,6 +141,10 @@ class JwtVerifier
     {
         $publicKey = $this->getPublicKey();
 
+        $this->logger->debug('Grace Period verify start', [
+            'grace_period' => $this->gracePeriod,
+        ]);
+
         try {
             // 不检查 exp，只验证签名
             $payload = JWT::decode(
@@ -96,6 +156,11 @@ class JwtVerifier
             // 检查是否在 Grace Period 内
             $expiredSince = time() - $payload->exp;
             if ($expiredSince > $this->gracePeriod) {
+                $this->logger->warning('JWT beyond Grace Period, reject', [
+                    'expired_since' => $expiredSince,
+                    'grace_period'  => $this->gracePeriod,
+                ]);
+
                 throw new JwtExpiredException(
                     Messages::get('jwt.expired_grace_period', (int) ($this->gracePeriod / 3600))
                 );
@@ -103,10 +168,19 @@ class JwtVerifier
 
             $this->assertProductMatches($payload);
 
+            $this->logger->info('JWT accepted within Grace Period', [
+                'expired_since' => $expiredSince,
+                'product'       => $payload->product ?? null,
+            ]);
+
             return $payload;
         } catch (JwtExpiredException $e) {
             throw $e;
         } catch (\Exception $e) {
+            $this->logger->error('JWT signature invalid (Grace Period)', [
+                'detail' => $e->getMessage(),
+            ]);
+
             throw new JwtSignatureException(
                 Messages::get('jwt.grace_period_signature_failed', $e->getMessage())
             );
@@ -118,9 +192,20 @@ class JwtVerifier
      */
     private function assertProductMatches(object $payload): void
     {
-        if (($payload->product ?? '') !== $this->productCode) {
+        $actual = $payload->product ?? '';
+        $this->logger->debug('JWT product check', [
+            'expected' => $this->productCode,
+            'actual'   => $actual,
+        ]);
+
+        if ($actual !== $this->productCode) {
+            $this->logger->warning('JWT product mismatch', [
+                'expected' => $this->productCode,
+                'actual'   => $actual,
+            ]);
+
             throw new JwtInvalidException(
-                Messages::get('jwt.product_mismatch', $this->productCode, $payload->product ?? 'null')
+                Messages::get('jwt.product_mismatch', $this->productCode, $actual)
             );
         }
     }
@@ -135,7 +220,17 @@ class JwtVerifier
         $expected = hash('sha256', $siteUrl);
         $actual = $payload->site_hash ?? '';
 
+        $this->logger->debug('JWT site binding check', [
+            'site_url'      => $siteUrl,
+            'expected_hash' => $this->mask($expected, 6),
+            'actual_hash'   => $this->mask($actual, 6),
+        ]);
+
         if (! hash_equals($expected, $actual)) {
+            $this->logger->warning('JWT site binding mismatch', [
+                'site_url' => $siteUrl,
+            ]);
+
             throw new JwtInvalidException(
                 Messages::get('jwt.site_mismatch')
             );

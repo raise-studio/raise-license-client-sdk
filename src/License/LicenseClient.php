@@ -4,6 +4,7 @@ namespace RaiseStudio\License;
 
 use RaiseStudio\License\Contracts\CacheInterface;
 use RaiseStudio\License\Contracts\HttpClientInterface;
+use RaiseStudio\License\Contracts\LoggerInterface;
 use RaiseStudio\License\Exceptions\LicenseRevokedException;
 
 class LicenseClient
@@ -30,6 +31,9 @@ class LicenseClient
     /** 单次请求内的内存缓存 */
     private ?object $cachedPayload = null;
 
+    /** 排障日志器（默认静默） */
+    private LoggerInterface $logger;
+
     /**
      * 构造函数
      *
@@ -39,6 +43,7 @@ class LicenseClient
      * @param HttpClientInterface $http            HTTP 客户端实现
      * @param string|null         $apiBaseUrl      License Server API 地址
      * @param string|null         $siteUrl          当前站点 URL
+     * @param LoggerInterface|null $logger         排障日志器（排查问题时注入）
      */
     public function __construct(
         private readonly string $productCode,
@@ -47,9 +52,11 @@ class LicenseClient
         HttpClientInterface $http,
         ?string $apiBaseUrl = null,
         ?string $siteUrl = null,
+        ?LoggerInterface $logger = null,
     ) {
         $this->cache = $cache;
         $this->http = $http;
+        $this->logger = $logger ?? new NullLogger();
 
         $this->cacheKey = "raise_license:{$productCode}:jwt";
         $this->configKey = "raise_license:{$productCode}:config";
@@ -63,6 +70,18 @@ class LicenseClient
             $this->productCode,
             $this->publicKeyBase64
         );
+        $this->verifier->setLogger($this->logger);
+    }
+
+    /**
+     * 注入排障日志器（排查问题时使用），并同步透传给 JwtVerifier。
+     */
+    public function setLogger(LoggerInterface $logger): self
+    {
+        $this->logger = $logger;
+        $this->verifier->setLogger($logger);
+
+        return $this;
     }
 
     // ══════════════════════════════════════════════════
@@ -136,6 +155,10 @@ class LicenseClient
     {
         // 显式开发模式（仅当用户主动设置 DEV_MODE 常量）
         if ($this->isExplicitDevMode()) {
+            $this->logger->info('activate: DEV_MODE active, skip server', [
+                'key_len' => strlen($licenseKey),
+            ]);
+
             $this->storeConfig($licenseKey, $email, '2099-12-31');
 
             return [
@@ -145,9 +168,16 @@ class LicenseClient
         }
 
         // 请求 JWT Token
+        $this->logger->info('activate: requesting token', [
+            'product' => $this->productCode,
+            'site'    => $this->getSiteUrl(),
+        ]);
+
         $result = $this->requestToken($licenseKey);
 
         if ($result === null) {
+            $this->logger->error('activate: connection failed (null result)');
+
             return [
                 'success' => false,
                 'message' => Messages::get('activation.connection_failed'),
@@ -158,6 +188,11 @@ class LicenseClient
         if (empty($result['token'])) {
             $errorCode = $result['error'] ?? 'unknown';
             $errorMsg  = $result['message'] ?? Messages::get('activation.failed');
+
+            $this->logger->warning('activate: server rejected', [
+                'error' => $errorCode,
+                'message' => $errorMsg,
+            ]);
 
             // 常见错误码 → 用户友好消息
             $friendlyMessages = [
@@ -181,6 +216,10 @@ class LicenseClient
         try {
             $this->verifier->verify($result['token']);
         } catch (\Exception $e) {
+            $this->logger->error('activate: JWT signature verify failed after server issue', [
+                'detail' => $e->getMessage(),
+            ]);
+
             return [
                 'success' => false,
                 'message' => Messages::get('activation.jwt_signature_failed', $e->getMessage()),
@@ -196,6 +235,11 @@ class LicenseClient
             $result['token_version'] ?? 0
         );
 
+        $this->logger->info('activate: success, token cached', [
+            'expires_at'    => $result['expires_at'] ?? null,
+            'token_version' => $result['token_version'] ?? 0,
+        ]);
+
         return [
             'success' => true,
             'message' => Messages::get('activation.success'),
@@ -209,9 +253,12 @@ class LicenseClient
     {
         $stored = $this->getStoredConfig();
         if (! empty($stored['key'])) {
+            $this->logger->info('deactivate: calling server deactivate');
+
             $this->callDeactivate($stored['key']);
         }
 
+        $this->logger->info('deactivate: local state cleared');
         $this->clearLocalState();
     }
 
@@ -222,11 +269,17 @@ class LicenseClient
     {
         $stored = $this->getStoredConfig();
         if (empty($stored['key'])) {
+            $this->logger->debug('refresh: no stored key, skip');
+
             return false;
         }
 
+        $this->logger->debug('refresh: requesting new token');
+
         $result = $this->requestToken($stored['key']);
         if ($result === null || empty($result['token'])) {
+            $this->logger->debug('refresh: failed (no token / connection error)');
+
             return false;
         }
 
@@ -237,8 +290,16 @@ class LicenseClient
             // 更新 token_version
             $this->markTokenVersion($result['token_version'] ?? 0);
 
+            $this->logger->info('refresh: success', [
+                'token_version' => $result['token_version'] ?? 0,
+            ]);
+
             return true;
         } catch (\Exception $e) {
+            $this->logger->error('refresh: token verify failed', [
+                'detail' => $e->getMessage(),
+            ]);
+
             return false;
         }
     }
@@ -262,6 +323,8 @@ class LicenseClient
     {
         // ① 内存缓存
         if ($this->cachedPayload !== null) {
+            $this->logger->debug('[①] payload from in-memory cache');
+
             return $this->cachedPayload;
         }
 
@@ -269,6 +332,8 @@ class LicenseClient
         $token = $this->cache->get($this->cacheKey);
 
         if ($token) {
+            $this->logger->debug('[②] cached JWT found, verifying', ['token_len' => strlen($token)]);
+
             try {
                 $this->cachedPayload = $this->verifier->verify($token);
                 // 验证站点绑定
@@ -277,27 +342,57 @@ class LicenseClient
                     $this->getSiteUrl()
                 );
 
+                $this->logger->info('[②] payload verified from cached JWT', [
+                    'product' => $this->cachedPayload->product ?? null,
+                ]);
+
                 return $this->cachedPayload;
             } catch (JwtExpiredException $e) {
                 // ③ Grace Period 失败 → 尝试刷新
+                $this->logger->warning('[②→③] cached JWT expired, will try silent refresh', [
+                    'detail' => $e->getMessage(),
+                ]);
                 $token = null;
             } catch (JwtSignatureException $e) {
                 // 签名无效 → 不降级，可能代码被篡改
+                $this->logger->error('[②] signature invalid, NO degradation (tamper suspected)');
+
                 return null;
             } catch (JwtInvalidException $e) {
                 // 站点不匹配等 → 不降级
+                $this->logger->error('[②] JWT invalid (site/product mismatch), NO degradation', [
+                    'detail' => $e->getMessage(),
+                ]);
+
                 return null;
             }
+        } else {
+            $this->logger->debug('[②] no cached JWT');
         }
 
         // ④ 静默刷新
+        $this->logger->debug('[④] attempting silent refresh');
         if ($this->refresh()) {
+            $this->logger->info('[④] silent refresh succeeded, re-verify');
+
             // 刷新成功，递归调用
             return $this->getVerifiedPayload();
         }
+        $this->logger->debug('[④] silent refresh failed');
 
         // ⑤ 离线容错
-        return $this->getOfflineFallback();
+        $this->logger->debug('[⑤] trying offline fallback');
+        $fallback = $this->getOfflineFallback();
+        if ($fallback !== null) {
+            $this->logger->info('[⑤] offline fallback granted (Pro via cache)');
+
+            return $fallback;
+        }
+
+        // ⑥ 降级为 Free
+        $this->logger->warning('[⑥] all paths failed, degraded to Free (no payload)');
+
+        return null;
     }
 
     /**
@@ -312,14 +407,22 @@ class LicenseClient
     {
         $stored = $this->getStoredConfig();
         if (empty($stored['key']) || empty($stored['activated'])) {
+            $this->logger->debug('[⑤] offline fallback unavailable: no stored/activated license');
+
             return null;
         }
 
         // 检查离线超时（7 天）
         $lastVerified = $stored['last_verified_at'] ?? 0;
         $offlineMaxSeconds = 7 * 86400;
+        $offlineSeconds = $lastVerified > 0 ? (time() - $lastVerified) : -1;
 
-        if ($lastVerified > 0 && (time() - $lastVerified) > $offlineMaxSeconds) {
+        if ($lastVerified > 0 && $offlineSeconds > $offlineMaxSeconds) {
+            $this->logger->warning('[⑤] offline too long, fallback denied → Free', [
+                'offline_seconds'  => $offlineSeconds,
+                'max_seconds'      => $offlineMaxSeconds,
+            ]);
+
             return null; // ⑤ 离线超过 7 天，不降级 → ⑥ 降为 Free
         }
 
@@ -345,8 +448,15 @@ class LicenseClient
     private function requestToken(string $licenseKey): ?array
     {
         try {
+            $url = rtrim($this->apiBaseUrl, '/') . '/token';
+            $this->logger->debug('requestToken: POST', [
+                'url'     => $url,
+                'product' => $this->productCode,
+                'site'    => $this->getSiteUrl(),
+            ]);
+
             $response = $this->http->post(
-                rtrim($this->apiBaseUrl, '/') . '/token',
+                $url,
                 [
                     'license_key' => $licenseKey,
                     'site_url'    => $this->getSiteUrl(),
@@ -357,12 +467,16 @@ class LicenseClient
 
             // 网络不可达（适配器返回 statusCode=0）
             if ($response->statusCode === 0) {
+                $this->logger->error('requestToken: network unreachable (statusCode=0)');
+
                 return null;
             }
 
             // 速率限制
             if ($response->statusCode === 429) {
                 $retryAfter = (int) ($response->header('Retry-After') ?: 60);
+
+                $this->logger->warning('requestToken: rate limited', ['retry_after' => $retryAfter]);
 
                 return [
                     'token'  => null,
@@ -375,6 +489,11 @@ class LicenseClient
 
             // Pattern 1: VerifyController/HeartbeatController — valid: false
             if (isset($body['valid']) && $body['valid'] === false) {
+                $this->logger->warning('requestToken: server reports invalid', [
+                    'error'   => $body['error'] ?? 'unknown',
+                    'message' => $body['message'] ?? null,
+                ]);
+
                 return [
                     'token'  => null,
                     'error'  => $body['error'] ?? 'unknown',
@@ -384,6 +503,11 @@ class LicenseClient
 
             // Pattern 2: ActivateController — success: false
             if (isset($body['success']) && $body['success'] === false) {
+                $this->logger->warning('requestToken: server reports failure', [
+                    'error'   => $body['error'] ?? 'unknown',
+                    'message' => $body['message'] ?? null,
+                ]);
+
                 return [
                     'token'  => null,
                     'error'  => $body['error'] ?? 'unknown',
@@ -393,6 +517,11 @@ class LicenseClient
 
             // Pattern 3: TokenController — raw error field (HTTP 4xx with JSON body)
             if (! empty($body['error']) && empty($body['token'])) {
+                $this->logger->warning('requestToken: server error field', [
+                    'error'   => $body['error'],
+                    'message' => $body['message'] ?? null,
+                ]);
+
                 return [
                     'token'  => null,
                     'error'  => $body['error'],
@@ -402,6 +531,10 @@ class LicenseClient
 
             // Pattern 4: HTTP 4xx/5xx without structured JSON error body
             if (! $response->successful()) {
+                $this->logger->error('requestToken: HTTP error', [
+                    'status' => $response->statusCode,
+                ]);
+
                 return [
                     'token'  => null,
                     'error'  => 'http_error',
@@ -410,6 +543,8 @@ class LicenseClient
             }
 
             if (empty($body['token'])) {
+                $this->logger->error('requestToken: no token in valid response');
+
                 return [
                     'token'  => null,
                     'error'  => 'invalid_response',
@@ -420,6 +555,13 @@ class LicenseClient
             // 更新最后验证时间
             $this->markVerified();
 
+            $this->logger->info('requestToken: success', [
+                'plan'          => $body['plan'] ?? '',
+                'expires_at'    => $body['expires_at'] ?? '',
+                'token_version' => $body['token_version'] ?? 0,
+                'feature_count' => count($body['features'] ?? []),
+            ]);
+
             return [
                 'token'         => $body['token'],
                 'features'      => $body['features'] ?? [],
@@ -428,6 +570,8 @@ class LicenseClient
                 'token_version' => $body['token_version'] ?? 0,
             ];
         } catch (\Exception $e) {
+            $this->logger->error('requestToken: exception', ['detail' => $e->getMessage()]);
+
             return null; // 网络异常
         }
     }
@@ -447,7 +591,15 @@ class LicenseClient
                 ],
                 10
             );
+
+            $this->logger->debug('deactivate: server response status', [
+                'status' => $response->statusCode,
+            ]);
         } catch (\Exception $e) {
+            $this->logger->warning('deactivate: server call failed (local state still cleared)', [
+                'detail' => $e->getMessage(),
+            ]);
+
             // 解绑失败不阻塞本地清除
         }
     }
@@ -465,8 +617,14 @@ class LicenseClient
         }
 
         try {
+            $url = rtrim($this->apiBaseUrl, '/') . '/heartbeat';
+            $this->logger->debug('heartbeat: POST', [
+                'url'          => $url,
+                'local_version'=> $stored['token_version'] ?? 0,
+            ]);
+
             $response = $this->http->post(
-                rtrim($this->apiBaseUrl, '/') . '/heartbeat',
+                $url,
                 [
                     'license_key' => $stored['key'],
                     'site_url'    => $this->getSiteUrl(),
@@ -476,15 +634,27 @@ class LicenseClient
             );
 
             if ($response->statusCode === 0) {
+                $this->logger->warning('heartbeat: network unreachable');
+
                 return null; // 网络不可达
             }
 
             if ($response->statusCode === 429) {
+                $this->logger->warning('heartbeat: rate limited, skip this round');
+
                 return ['valid' => true, '_rate_limited' => true, 'token_version' => $stored['token_version'] ?? 0];
             }
 
-            return $response->json();
+            $body = $response->json();
+            $this->logger->debug('heartbeat: response', [
+                'valid'         => $body['valid'] ?? null,
+                'server_version'=> $body['token_version'] ?? 0,
+            ]);
+
+            return $body;
         } catch (\Exception $e) {
+            $this->logger->error('heartbeat: exception', ['detail' => $e->getMessage()]);
+
             return null; // 网络不可达，不算吊销
         }
     }
@@ -505,17 +675,23 @@ class LicenseClient
     {
         $stored = $this->getStoredConfig();
         if (empty($stored['key'])) {
+            $this->logger->debug('heartbeat: no stored key, skip');
+
             return null;
         }
 
         $response = $this->callHeartbeat();
 
         if ($response === null) {
+            $this->logger->warning('heartbeat: unreachable, no change');
+
             return null; // 网络不可达 — 不做任何变更
         }
 
         // 速率限制 — 跳过本轮
         if (! empty($response['_rate_limited'])) {
+            $this->logger->debug('heartbeat: rate limited, skip');
+
             return $response;
         }
 
@@ -524,6 +700,8 @@ class LicenseClient
         $localVersion  = (int) ($stored['token_version'] ?? 0);
 
         if ($response['valid'] === false && ($response['error'] ?? '') === 'license_suspended') {
+            $this->logger->error('heartbeat: license SUSPENDED → revoke & clear local state');
+
             $this->clearLocalState();
             throw new LicenseRevokedException(
                 $response['message'] ?? Messages::get('heartbeat.revoked')
@@ -532,6 +710,11 @@ class LicenseClient
 
         // token_version 增大 → License 经历了一次吊销-恢复
         if ($serverVersion > $localVersion && $localVersion > 0) {
+            $this->logger->error('heartbeat: token_version changed → revoke & clear', [
+                'local'  => $localVersion,
+                'server' => $serverVersion,
+            ]);
+
             $this->clearLocalState();
             throw new LicenseRevokedException(
                 Messages::get('heartbeat.token_version_changed', $localVersion, $serverVersion)
@@ -540,11 +723,18 @@ class LicenseClient
 
         // 更新本地 token_version
         if ($serverVersion > $localVersion) {
+            $this->logger->info('heartbeat: token_version updated', [
+                'local'  => $localVersion,
+                'server' => $serverVersion,
+            ]);
+
             $this->markTokenVersion($serverVersion);
         }
 
         // 更新最后验证时间
         $this->markVerified();
+
+        $this->logger->info('heartbeat: OK', ['valid' => $response['valid'] ?? null]);
 
         return $response;
     }

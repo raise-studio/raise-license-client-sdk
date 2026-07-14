@@ -2,6 +2,8 @@
 
 namespace RaiseStudio\License;
 
+use RaiseStudio\License\Contracts\LoggerInterface;
+
 class IntegrityCheck
 {
     /**
@@ -23,6 +25,26 @@ class IntegrityCheck
     ];
 
     /**
+     * 排障日志器（默认静默）
+     */
+    private LoggerInterface $logger;
+
+    public function __construct(?LoggerInterface $logger = null)
+    {
+        $this->logger = $logger ?? new NullLogger();
+    }
+
+    /**
+     * 注入排障日志器（排查问题时使用）。
+     */
+    public function setLogger(LoggerInterface $logger): self
+    {
+        $this->logger = $logger;
+
+        return $this;
+    }
+
+    /**
      * 验证所有被保护文件的完整性
      *
      * 耦合进功能：验证失败时不是简单返回 false，
@@ -42,15 +64,26 @@ class IntegrityCheck
 
         // 如果占位符未被替换（开发者环境），跳过检查
         if (empty($hashes) || $hashes === ['BUILD_HASH_PLACEHOLDER']) {
+            $this->logger->debug('Integrity check skipped (developer mode / placeholder not replaced)');
+
             $result = true;
 
             return $result;
         }
 
+        $this->logger->debug('Integrity check start', [
+            'files' => count($hashes),
+        ]);
+
         foreach ($hashes as $file => $expected) {
             $path = $this->resolvePath($file);
 
             if (! file_exists($path)) {
+                $this->logger->warning('Protected file missing, integrity FAILED', [
+                    'file' => $file,
+                    'path' => $path,
+                ]);
+
                 $result = false;
 
                 return $result;
@@ -59,11 +92,21 @@ class IntegrityCheck
             $actual = hash_file('sha256', $path);
 
             if (! hash_equals($expected, $actual)) {
+                $this->logger->warning('Hash mismatch, integrity FAILED (tamper suspected)', [
+                    'file'          => $file,
+                    'expected_len'  => strlen($expected),
+                    'actual_len'    => strlen((string) $actual),
+                ]);
+
                 $result = false;
 
                 return $result;
             }
+
+            $this->logger->debug('File integrity OK', ['file' => $file]);
         }
+
+        $this->logger->info('Integrity check passed', ['files' => count($hashes)]);
 
         $result = true;
 

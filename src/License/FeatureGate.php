@@ -2,6 +2,8 @@
 
 namespace RaiseStudio\License;
 
+use RaiseStudio\License\Contracts\LoggerInterface;
+
 class FeatureGate
 {
     private LicenseClient $license;
@@ -19,10 +21,27 @@ class FeatureGate
      */
     private array $allProFeatures = [];
 
-    public function __construct(LicenseClient $license)
+    /**
+     * 排障日志器（默认静默）
+     */
+    private LoggerInterface $logger;
+
+    public function __construct(LicenseClient $license, ?LoggerInterface $logger = null)
     {
         $this->license = $license;
-        $this->integrity = new IntegrityCheck();
+        $this->logger = $logger ?? new NullLogger();
+        $this->integrity = new IntegrityCheck($this->logger);
+    }
+
+    /**
+     * 注入排障日志器（排查问题时使用）。
+     */
+    public function setLogger(LoggerInterface $logger): self
+    {
+        $this->logger = $logger;
+        $this->integrity->setLogger($logger);
+
+        return $this;
     }
 
     /**
@@ -52,13 +71,21 @@ class FeatureGate
      */
     public function canUse(string $feature): bool
     {
+        $this->logger->debug('FeatureGate.canUse start', ['feature' => $feature]);
+
         // D4: 每次检查前先验完整性
         if (! $this->integrity->verify()) {
+            $this->logger->warning('Integrity FAILED, degrading canUse() to Free', [
+                'feature' => $feature,
+            ]);
+
             return $this->isFreeFeature($feature);
         }
 
         // 免费功能始终可用
         if ($this->isFreeFeature($feature)) {
+            $this->logger->debug('Free feature allowed', ['feature' => $feature]);
+
             return true;
         }
 
@@ -67,10 +94,21 @@ class FeatureGate
 
         // '*' 表示任何 Pro 功能
         if ($feature === '*') {
-            return ! empty($features);
+            $allowed = ! empty($features);
+
+            $this->logger->info('Pro availability check', ['allowed' => $allowed]);
+
+            return $allowed;
         }
 
-        return in_array($feature, $features, true);
+        $allowed = in_array($feature, $features, true);
+
+        $this->logger->info('Feature access decision', [
+            'feature' => $feature,
+            'allowed' => $allowed,
+        ]);
+
+        return $allowed;
     }
 
     /**

@@ -213,6 +213,20 @@ JWT 有效 (6h)?          → JWT payload.features[]
 以上全失败               → Free
 ```
 
+## 排障日志
+
+激活失败 / 验证异常 / 功能被意外降级时，可开启分级日志定位问题。SDK 默认静默（`NullLogger`），不影响性能。
+
+```php
+use RaiseStudio\License\FileLogger;
+
+$logger = new FileLogger(__DIR__ . '/raise-license.log', 'debug', 'raise-license');
+$client->setLogger($logger);   // 同步透传给 JwtVerifier
+$gate->setLogger($logger);     // 同步透传给 IntegrityCheck
+```
+
+开启后，每个验证步骤都会输出带级别与 `[②][④][⑤]` 降级阶段标记的日志（详见 `docs/raise-license-client-sdk.md` 4.3 节）。日志**不**含明文 License Key / JWT Token，敏感字段已脱敏。
+
 ## 文档
 
 - [集成示例](docs/sdk-integration-example.md)
